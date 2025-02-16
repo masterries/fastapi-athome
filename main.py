@@ -7,6 +7,7 @@ app = FastAPI()
 
 origins = [
     "*",
+    "https://super-winner-gx66wvjx9jw3g5w-3000.app.github.dev",
     # Add any other domains you want to allow
 ]
 

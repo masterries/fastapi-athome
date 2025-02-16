@@ -69,9 +69,9 @@ def get_property_data(transaction: Optional[str], sold: str, year: Optional[int]
     
     sold_lower = sold.lower()
     if sold_lower == "sold":
-        query += " AND soldat IS NOT NULL AND soldat != ''"
+        query += " AND soldat IS NOT NULL AND soldat != 'NaN'"
     elif sold_lower == "unsold":
-        query += " AND (soldat IS NULL OR soldat = '')"
+        query += " AND (soldat IS NULL OR soldat = 'NaN')"
     # For "both", no filter is applied.
 
     if year is not None:
@@ -294,9 +294,9 @@ async def get_cube_data(
 
     sold_lower = sold.lower()
     if sold_lower == "sold":
-        query += " AND soldat IS NOT NULL AND soldat != ''"
+        query += " AND soldat IS NOT NULL AND soldat != 'NaN'"
     elif sold_lower == "unsold":
-        query += " AND (soldat IS NULL OR soldat = '')"
+        query += " AND (soldat IS NULL OR soldat = 'NaN')"
     # For "both", no sold filter is added.
 
     if transaction.lower() != "both":
