@@ -1,8 +1,22 @@
 from fastapi import FastAPI
 import psycopg2
 import os
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+origins = [
+    "*",
+    # Add any other domains you want to allow
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # or use ["*"] to allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DATABASE_PUBLIC_URL = os.getenv("DATABASE_PUBLIC_URL")  # This can be used in main as well.
 
