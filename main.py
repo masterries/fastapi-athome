@@ -30,4 +30,4 @@ app.include_router(aggregated_router)
 from router.raw_router import router as raw_router
 app.include_router(raw_router)
 from router.raster_router import router as raster_router
-app.include_router(raster_router)
+app.include_router(raster_router, prefix="/raster")

@@ -150,10 +150,12 @@ def get_cell_bounds(cell_id: str, center_lat: float = DEFAULT_CENTER_LAT,
     }
 
 # --- Statistics Calculation ---
+
 def calculate_grid_statistics(listings: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Calculate summary statistics for a group of listings.
     Computes count, average, median, minimum, and maximum price per m².
+    Skips any values that evaluate to NaN.
     """
     prices_per_m2 = []
     for listing in listings:
@@ -161,16 +163,24 @@ def calculate_grid_statistics(listings: List[Dict[str, Any]]) -> Dict[str, Any]:
         surface = listing.get("surface")
         if price is None or surface in (None, 0):
             continue
-        prices_per_m2.append(price / surface)
+        value = price / surface
+        # Skip if the computed value is NaN.
+        if math.isnan(value):
+            continue
+        prices_per_m2.append(value)
+    
     count = len(prices_per_m2)
     if count == 0:
         return {}
+    
     avg_price = sum(prices_per_m2) / count
     sorted_prices = sorted(prices_per_m2)
+    
     if count % 2 == 1:
         median_price = sorted_prices[count // 2]
     else:
         median_price = (sorted_prices[count // 2 - 1] + sorted_prices[count // 2]) / 2
+    
     return {
         "count": count,
         "avg_price_per_m2": avg_price,
@@ -178,7 +188,6 @@ def calculate_grid_statistics(listings: List[Dict[str, Any]]) -> Dict[str, Any]:
         "min_price_per_m2": min(prices_per_m2),
         "max_price_per_m2": max(prices_per_m2)
     }
-
 # --- Data Fetching and Raster Calculation with Caching ---
 @lru_cache(maxsize=100)
 def fetch_and_calculate_raster(params: GridQueryParams) -> Dict[str, Any]:
@@ -222,7 +231,7 @@ def fetch_and_calculate_raster(params: GridQueryParams) -> Dict[str, Any]:
     return result
 
 # --- API Endpoint ---
-@router.get("/raster")
+@router.get("/raster_Immo")
 async def get_raster(
     transaction: Optional[str] = Query(None, description="Transaction type: 'buy' or 'rent'. If omitted, both are returned."),
     sold: str = Query("sold", description="Sold status: 'sold', 'unsold', or 'both' (default: sold)"),
@@ -248,3 +257,101 @@ async def get_raster(
     )
     result = fetch_and_calculate_raster(params)
     return result
+
+
+
+@router.get("/cube")
+async def get_cube_data(
+    lat_min: float = Query(..., description="Minimum latitude of the cube bounds"),
+    lon_min: float = Query(..., description="Minimum longitude of the cube bounds"),
+    lat_max: float = Query(..., description="Maximum latitude of the cube bounds"),
+    lon_max: float = Query(..., description="Maximum longitude of the cube bounds"),
+    year: Optional[int] = Query(None, description="Year filter. If omitted, returns listings for all years."),
+    sold: str = Query("both", description="Sold status: 'sold', 'unsold', or 'both' (default: both)"),
+    transaction: str = Query("both", description="Transaction type: 'buy', 'rent', or 'both' (default: both)")
+) -> Dict[str, Any]:
+    """
+    Returns raw listing data (all columns) from the database that fall within the
+    specified cube (bounding box). Filtering options include:
+      - Year: Uses the first 4 characters of the createdat text field.
+      - Sold: 'sold', 'unsold', or 'both'.
+      - Transaction: 'buy', 'rent', or 'both'.
+    """
+    query = """
+    SELECT *
+    FROM listings
+    WHERE (address_pin_lat)::float >= %s
+      AND (address_pin_lat)::float <= %s
+      AND (address_pin_lon)::float >= %s
+      AND (address_pin_lon)::float <= %s
+    """
+    query_params = [lat_min, lat_max, lon_min, lon_max]
+
+    if year is not None:
+        # Extract the year from the text field "createdat"
+        query += " AND SUBSTRING(createdat, 1, 4)::int = %s"
+        query_params.append(year)
+
+    sold_lower = sold.lower()
+    if sold_lower == "sold":
+        query += " AND soldat IS NOT NULL AND soldat != ''"
+    elif sold_lower == "unsold":
+        query += " AND (soldat IS NULL OR soldat = '')"
+    # For "both", no sold filter is added.
+
+    if transaction.lower() != "both":
+        query += " AND LOWER(transaction) = LOWER(%s)"
+        query_params.append(transaction)
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, query_params)
+                rows = cursor.fetchall()
+        raw_data = [dict(row) for row in rows]
+        return {
+            "cube_bounds": {
+                "lat_min": lat_min,
+                "lon_min": lon_min,
+                "lat_max": lat_max,
+                "lon_max": lon_max
+            },
+            "year": year if year is not None else "all",
+            "sold": sold,
+            "transaction": transaction,
+            "data": raw_data,
+            "count": len(raw_data)
+        }
+    except Exception as e:
+        logger.error(f"Cube query failed: {e}")
+        raise HTTPException(status_code=500, detail="Cube query failed")
+
+
+@router.get("/raster/grid_raw", response_model=list[dict])
+async def get_raster_grid(
+    grid_size: float = Query(1.0, description="Grid size in kilometers for the raster (default: 1.0 km)"),
+    center_lat: float = Query(DEFAULT_CENTER_LAT, description="Center latitude for the grid (default: 49.6116)"),
+    center_lon: float = Query(DEFAULT_CENTER_LON, description="Center longitude for the grid (default: 6.1319)")
+) -> list[dict]:
+    """
+    Returns the raw raster grid as a list of cells.
+    Each cell object includes:
+      - cell_id (e.g. "1_1")
+      - bounds: a dictionary with lat_min, lon_min, lat_max, and lon_max.
+    
+    This endpoint uses all listings (i.e. no filtering by sold, transaction, or year)
+    and calculates the grid based on the provided grid_size and center coordinates.
+    """
+    # Build parameters that fetch all listings (no filtering)
+    params = GridQueryParams(
+        transaction=None,
+        sold="both",  # Use both sold and unsold listings
+        grid_size=grid_size,
+        center_lat=center_lat,
+        center_lon=center_lon,
+        year=None      # Use listings from all years
+    )
+    result = fetch_and_calculate_raster(params)
+    # Return only the cell_id and bounds for each cell
+    grid_cells = [{"cell_id": cell["cell_id"], "bounds": cell["bounds"]} for cell in result["cells"]]
+    return grid_cells
