@@ -4,10 +4,10 @@ import os
 
 app = FastAPI()
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # This can be used in main as well.
+DATABASE_PUBLIC_URL = os.getenv("DATABASE_PUBLIC_URL")  # This can be used in main as well.
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_PUBLIC_URL)
 
 @app.get("/")
 def read_root():
@@ -27,3 +27,5 @@ def get_listings(limit: int = 10):
 # Import and include the aggregated router from the router folder.
 from router.aggregated_router import router as aggregated_router
 app.include_router(aggregated_router)
+from router.raw_router import router as raw_router
+app.include_router(raw_router)
