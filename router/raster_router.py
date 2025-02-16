@@ -355,3 +355,171 @@ async def get_raster_grid(
     # Return only the cell_id and bounds for each cell
     grid_cells = [{"cell_id": cell["cell_id"], "bounds": cell["bounds"]} for cell in result["cells"]]
     return grid_cells
+
+
+from datetime import datetime
+import statistics
+from typing import Dict, List, Optional
+
+from datetime import datetime
+import statistics
+from typing import Dict, List, Optional
+
+@router.get("/raster/time_to_close_stats")
+async def get_time_to_close_stats(
+    grid_size: float = Query(1.0, description="Grid size in kilometers for the raster (default: 1.0 km)"),
+    center_lat: float = Query(DEFAULT_CENTER_LAT, description="Center latitude for the grid (default: 49.6116)"),
+    center_lon: float = Query(DEFAULT_CENTER_LON, description="Center longitude for the grid (default: 6.1319)"),
+    transaction: Optional[str] = Query(None, description="Transaction type: 'buy' or 'rent'. If omitted, both are returned.")
+) -> Dict[str, Any]:
+    """
+    Calculate time-to-close statistics for each year and grid cell.
+    Returns median, average, Q1, and Q3 of days to close for valid sales.
+    """
+    def parse_created_date(date_str: str) -> Optional[datetime]:
+        """Parse createdat date in format '20220413T135211Z'"""
+        if not date_str or date_str == 'NaN':
+            return None
+        try:
+            return datetime.strptime(date_str, "%Y%m%dT%H%M%SZ")
+        except ValueError:
+            logger.warning(f"Could not parse created date: {date_str}")
+            return None
+
+    def parse_sold_date(date_str: str) -> Optional[datetime]:
+        """Parse soldat date in format '2024-07-12T11:37:56Z'"""
+        if not date_str or date_str == 'NaN':
+            return None
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            logger.warning(f"Could not parse sold date: {date_str}")
+            return None
+
+    def calculate_time_stats(days_list: List[int]) -> Dict[str, float]:
+        """Calculate statistics for a list of days-to-close values"""
+        if not days_list:
+            return {}
+        
+        sorted_days = sorted(days_list)
+        n = len(sorted_days)
+        
+        return {
+            "count": n,
+            "median_days": statistics.median(sorted_days),
+            "avg_days": statistics.mean(sorted_days),
+            "q1_days": sorted_days[n // 4] if n >= 4 else sorted_days[0],
+            "q3_days": sorted_days[3 * n // 4] if n >= 4 else sorted_days[-1]
+        }
+
+    try:
+        # Fetch all properties with potential sales
+        query = """
+        SELECT 
+            createdat,
+            soldat,
+            address_pin_lat AS lat,
+            address_pin_lon AS lon,
+            transaction
+        FROM listings
+        WHERE soldat IS NOT NULL 
+        AND soldat != 'NaN'
+        AND createdat IS NOT NULL
+        """
+        
+        query_params = []
+        if transaction:
+            query += " AND LOWER(transaction) = LOWER(%s)"
+            query_params.append(transaction)
+
+        logger.info(f"Executing query: {query} with params: {query_params}")
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, query_params)
+                rows = cursor.fetchall()
+
+        logger.info(f"Found {len(rows)} total rows")
+
+        # Process the data by year and grid cell
+        yearly_grid_stats = {}
+        skipped_count = 0
+        invalid_dates_count = 0
+        valid_entries = 0
+        
+        for row in rows:
+            created_date = parse_created_date(str(row['createdat']))
+            sold_date = parse_sold_date(str(row['soldat']))
+            
+            # Debug logging for dates
+            if not created_date or not sold_date:
+                invalid_dates_count += 1
+                logger.debug(f"Invalid dates - created: {row['createdat']}, sold: {row['soldat']}")
+                continue
+                
+            if sold_date <= created_date:
+                skipped_count += 1
+                continue
+                
+            # Calculate days to close
+            days_to_close = (sold_date - created_date).days
+            
+            # Get the year
+            year = created_date.year
+            
+            # Calculate grid cell
+            try:
+                lat = float(row['lat'])
+                lon = float(row['lon'])
+            except (TypeError, ValueError):
+                logger.debug(f"Invalid coordinates - lat: {row['lat']}, lon: {row['lon']}")
+                continue
+                
+            cell_id = get_grid_cell(lat, lon, center_lat, center_lon, grid_size)
+            if not cell_id:
+                continue
+            
+            # Initialize year and cell if needed
+            if year not in yearly_grid_stats:
+                yearly_grid_stats[year] = {}
+            if cell_id not in yearly_grid_stats[year]:
+                yearly_grid_stats[year][cell_id] = []
+                
+            yearly_grid_stats[year][cell_id].append(days_to_close)
+            valid_entries += 1
+        
+        # Calculate statistics for each year and cell
+        result = {}
+        for year in yearly_grid_stats:
+            result[year] = []
+            for cell_id, days_list in yearly_grid_stats[year].items():
+                stats = calculate_time_stats(days_list)
+                if stats:  # Only include cells with valid data
+                    bounds = get_cell_bounds(cell_id, center_lat, center_lon, grid_size)
+                    result[year].append({
+                        "cell_id": cell_id,
+                        "bounds": bounds,
+                        "statistics": stats
+                    })
+        
+        return {
+            "center": {"lat": center_lat, "lon": center_lon},
+            "grid_size_km": grid_size,
+            "transaction": transaction if transaction else "all",
+            "yearly_stats": result,
+            "debug_info": {
+                "total_rows": len(rows),
+                "invalid_dates": invalid_dates_count,
+                "skipped_sold_before_created": skipped_count,
+                "valid_entries": valid_entries,
+                "years_found": list(yearly_grid_stats.keys()) if yearly_grid_stats else [],
+                "sample_dates": {
+                    "first_row_created": str(rows[0]['createdat']) if rows else None,
+                    "first_row_sold": str(rows[0]['soldat']) if rows else None
+                }
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Time-to-close calculation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Time-to-close calculation failed: {str(e)}")
