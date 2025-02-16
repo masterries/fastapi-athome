@@ -1,114 +1,172 @@
-from fastapi import APIRouter, Query
-from typing import Optional
-import os
+from fastapi import APIRouter, Query, HTTPException
+from typing import Optional, Dict, Any
 import psycopg2
-import pandas as pd
+from psycopg2.extras import RealDictCursor
+import time
+import logging
+from datetime import datetime
+from functools import lru_cache
+from dataclasses import dataclass
+from config import DATABASE_URL
 
-from config import DATABASE_URL  # centralized configuration
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+@dataclass(frozen=True)
+class QueryParams:
+    """Immutable class for cache keys"""
+    country: str
+    transaction: Optional[str]
+    sold: str
+    limit: int
+    page: int
+    all_columns: bool
+
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor
+    )
+
+# Cache for the actual data fetching function
+@lru_cache(maxsize=100)  # Cache last 100 unique queries
+def fetch_data(params: QueryParams) -> Dict[str, Any]:
+    """Cached function to fetch data from database"""
+    query_start = time.time()
+    metrics = {}
+
+    # Calculate offset for pagination
+    offset = (params.page - 1) * params.limit
+
+    # Build the query with proper indexing
+    select_clause = "*" if params.all_columns else """
+        id,
+        price,
+        characteristic_surface AS surface,
+        createdat,
+        soldat,
+        transaction,
+        address_country AS country
+    """
+
+    # Base query with index-optimized ordering
+    query = f"""
+    SELECT {select_clause}
+    FROM listings
+    WHERE transaction IN ('rent', 'buy')
+    AND LOWER(address_country) = LOWER(%s)
+    """
+    query_params = [params.country]
+
+    # Add transaction filter if specified
+    if params.transaction:
+        query += " AND LOWER(transaction) = LOWER(%s)"
+        query_params.append(params.transaction)
+
+    # Add sold status filter
+    if params.sold.lower() == "sold":
+        query += " AND soldat IS NOT NULL AND soldat != ''"
+    elif params.sold.lower() == "unsold":
+        query += " AND (soldat IS NULL OR soldat = '')"
+
+    # Get total count with a separate optimized query
+    count_query = f"""
+    SELECT COUNT(*) as count
+    FROM listings
+    WHERE transaction IN ('rent', 'buy')
+    AND LOWER(address_country) = LOWER(%s)
+    """
+    count_params = [params.country]
+    if params.transaction:
+        count_query += " AND LOWER(transaction) = LOWER(%s)"
+        count_params.append(params.transaction)
+
+    # Add sorting and pagination
+    query += " ORDER BY createdat DESC NULLS LAST"
+    query += f" LIMIT {params.limit} OFFSET {offset}"
+
+    try:
+        with get_db_connection() as conn:
+            # Get total count
+            count_start = time.time()
+            with conn.cursor() as cursor:
+                cursor.execute(count_query, count_params)
+                result = cursor.fetchone()
+                total_count = list(result.values())[0] if result else 0
+            metrics['count_query_time'] = time.time() - count_start
+            
+            # Get paginated data
+            data_start = time.time()
+            with conn.cursor() as cursor:
+                cursor.execute(query, query_params)
+                rows = cursor.fetchall()
+            metrics['data_query_time'] = time.time() - data_start
+
+    except Exception as e:
+        logger.error(f"Database query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Process the results
+    processing_start = time.time()
+    
+    # Convert to list of dicts and clean up data
+    result = []
+    for row in rows:
+        # Convert row from RealDictRow to regular dict
+        clean_row = dict(row)
+        
+        # Convert datetime objects to ISO format strings
+        for key, value in clean_row.items():
+            if isinstance(value, datetime):
+                clean_row[key] = value.isoformat()
+        
+        result.append(clean_row)
+
+    metrics['processing_time'] = time.time() - processing_start
+    total_time = time.time() - query_start
+
+    # Log performance metrics
+    logger.info(f"Count query completed in {metrics['count_query_time']:.2f} seconds")
+    logger.info(f"Data query returned {len(rows)} rows in {metrics['data_query_time']:.2f} seconds")
+    logger.info(f"Data processing completed in {metrics['processing_time']:.2f} seconds")
+    logger.info(f"Total processing time: {total_time:.2f} seconds")
+    
+    return {
+        "page": params.page,
+        "limit": params.limit,
+        "total": total_count,
+        "data": result,
+        "performance_metrics": metrics
+    }
 
 @router.get("/raw")
-def get_raw_data(
+async def get_raw_data(
     country: str = Query("Luxembourg", description="Country filter (default: Luxembourg)"),
     transaction: Optional[str] = Query(None, description="Transaction type: 'buy' or 'rent'. If omitted, both are returned."),
     sold: str = Query("sold", description="Sold status: 'sold', 'unsold', or 'both' (default: sold)"),
     limit: int = Query(10, description="Number of records per page (default: 10)"),
     page: int = Query(1, description="Page number (default: 1)"),
     all_columns: bool = Query(False, description="If True, returns all columns from the database")
-):
+) -> Dict[str, Any]:
     """
-    Returns listings filtered by country, transaction, and sold status.
-    The results are sorted by created date and paginated.
-    When all_columns=True, returns all columns from the database instead of the default subset.
+    Returns listings data with in-memory caching.
     """
-    # Fetch data from the database
-    conn = get_db_connection()
+    # Create immutable params object for cache key
+    params = QueryParams(
+        country=country,
+        transaction=transaction,
+        sold=sold,
+        limit=limit,
+        page=page,
+        all_columns=all_columns
+    )
     
-    # Construct the SELECT part of the query based on all_columns parameter
-    select_clause = "*" if all_columns else """
-        id,
-        price,
-        "characteristic_surface" AS surface,
-        createdat,
-        soldat,
-        transaction,
-        "address_country" AS country
-    """
+    # Log cache info
+    cache_info = fetch_data.cache_info()
+    logger.info(f"Cache stats: {cache_info}")
     
-    query = f"""
-    SELECT {select_clause}
-    FROM listings
-    WHERE transaction IN ('rent', 'buy')
-    """
-    
-    try:
-        df = pd.read_sql(query, conn)
-    except Exception as e:
-        conn.close()
-        raise e
-    conn.close()
-
-    # If all columns are requested, only do minimal cleaning
-    if all_columns:
-        # Convert createdat to datetime if it exists
-        if 'createdat' in df.columns:
-            df['createdat_dt'] = pd.to_datetime(df['createdat'], 
-                                              format='%Y%m%dT%H%M%SZ', 
-                                              errors='coerce')
-            df = df.dropna(subset=['createdat_dt'])
-        
-        # Normalize soldat if it exists
-        if 'soldat' in df.columns:
-            df['soldat'] = df['soldat'].astype(str).str.strip().str.lower()
-            df.loc[df['soldat'] == 'nan', 'soldat'] = ""
-        
-        # Filter by country if the column exists
-        if 'address_country' in df.columns:
-            df = df[df['address_country'].str.lower() == country.lower()]
-    else:
-        # Original data cleaning for default column set
-        df = df.dropna(subset=['price', 'surface', 'createdat'])
-        df['price'] = pd.to_numeric(df['price'], errors='coerce')
-        df['surface'] = pd.to_numeric(df['surface'], errors='coerce')
-        df = df[(df['price'] > 0) & (df['surface'] > 0)]
-
-        df['createdat_dt'] = pd.to_datetime(df['createdat'], 
-                                          format='%Y%m%dT%H%M%SZ', 
-                                          errors='coerce')
-        df = df.dropna(subset=['createdat_dt'])
-
-        df['soldat'] = df['soldat'].astype(str).str.strip().str.lower()
-        df.loc[df['soldat'] == 'nan', 'soldat'] = ""
-
-        df = df[df['country'].str.lower() == country.lower()]
-
-    # Common filtering regardless of all_columns
-    if transaction and transaction.lower() in ['buy', 'rent']:
-        df = df[df['transaction'].str.lower() == transaction.lower()]
-
-    if sold.lower() == "sold":
-        df = df[df['soldat'] != ""]
-    elif sold.lower() == "unsold":
-        df = df[df['soldat'] == ""]
-
-    # Sort by createdat_dt if it exists, otherwise skip sorting
-    if 'createdat_dt' in df.columns:
-        df = df.sort_values(by='createdat_dt', ascending=True)
-
-    # Pagination
-    offset = (page - 1) * limit
-    df_page = df.iloc[offset:offset + limit]
-
-    # Convert to records
-    result = df_page.to_dict(orient="records")
-
-    return {
-        "page": page,
-        "limit": limit,
-        "total": len(df),
-        "data": result
-    }
+    # Return cached or fresh data
+    return fetch_data(params)
