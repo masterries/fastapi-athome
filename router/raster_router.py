@@ -523,3 +523,6 @@ async def get_time_to_close_stats(
     except Exception as e:
         logger.error(f"Time-to-close calculation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Time-to-close calculation failed: {str(e)}")
+
+
+#test
